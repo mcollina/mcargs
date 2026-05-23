@@ -4,8 +4,8 @@
 
 ## Requirements
 
-- Node.js 24 or newer
-- No build step is required for development; Node runs the `.ts` files directly via type stripping.
+- Node.js 22.19 or newer
+- No build step is required for development; supported Node versions run the `.ts` files directly via type stripping.
 
 ## Install/use
 
