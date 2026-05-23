@@ -83,14 +83,24 @@ test('supports config, env, pkgConf, middleware, normalize and nargs flows', asy
   assert.equal(argv.fromMiddleware, true);
 });
 
-test('supports commandDir for CommonJS command modules', () => {
+test('supports commandDir for CommonJS and ESM command modules', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'mcargs-commands-'));
   mkdirSync(join(dir, 'commands'));
   writeFileSync(join(dir, 'commands', 'hello.cjs'), `module.exports = { command: 'hello <name>', builder: y => y.positional('name', { type: 'string' }), handler: argv => { argv.greeted = argv.name } }`);
+  writeFileSync(join(dir, 'commands', 'bye.mjs'), `export default { command: 'bye <name>', builder: y => y.positional('name', { type: 'string' }), handler: argv => { argv.farewell = argv.name } }`);
 
-  const argv = yargs(['hello', 'Ada']).commandDir(join(dir, 'commands')).parseSync();
-  assert.equal(argv.name, 'Ada');
-  assert.equal(argv.greeted, 'Ada');
+  const hello = await yargs(['hello', 'Ada']).commandDir(join(dir, 'commands')).parseAsync();
+  assert.equal(hello.name, 'Ada');
+  assert.equal(hello.greeted, 'Ada');
+
+  const bye = await yargs(['bye', 'Grace']).commandDir(join(dir, 'commands')).parseAsync();
+  assert.equal(bye.name, 'Grace');
+  assert.equal(bye.farewell, 'Grace');
+
+  assert.throws(
+    () => yargs(['hello', 'Ada']).commandDir(join(dir, 'commands')).parseSync(),
+    /use parseAsync\(\)/
+  );
 });
 
 test('supports additional validation APIs', () => {

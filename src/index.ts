@@ -1,9 +1,7 @@
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
-import { createRequire } from 'node:module';
 import { dirname, extname, join, normalize as normalizePath, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
-
-const require = createRequire(import.meta.url);
 
 export type PrimitiveOptionType = 'string' | 'number' | 'boolean' | 'array' | 'count';
 
@@ -204,6 +202,8 @@ class Mcargs implements Argv {
   private middlewareBeforeValidation: MiddlewareFunction[] = [];
   private middlewareAfterValidation: MiddlewareFunction[] = [];
   private completionFunction?: (current: string, argv: Arguments) => string[] | Promise<string[]>;
+  private commandDirLoads: Array<Promise<void>> = [];
+  private commandDirLoadError?: Error;
   private usageMessage?: string;
   private epilogMessage?: string;
   private failCallback?: FailCallback;
@@ -554,12 +554,16 @@ class Mcargs implements Argv {
 
   commandDir(directory: string, options: { extensions?: string[]; recurse?: boolean } = {}): this {
     const base = resolve(directory);
-    const extensions = options.extensions ?? ['.js', '.cjs', '.json'];
-    for (const file of findCommandFiles(base, extensions, options.recurse ?? false)) {
-      const loaded = require(file) as CommandModule | { default?: CommandModule };
-      const commandModule = 'default' in loaded && loaded.default ? loaded.default : loaded;
-      this.command(commandModule as CommandModule);
-    }
+    const extensions = options.extensions ?? ['.js', '.cjs', '.mjs'];
+    const loads = findCommandFiles(base, extensions, options.recurse ?? false).map(async (file) => {
+      const loaded = await import(pathToFileURL(file).href) as CommandModule | { default?: CommandModule };
+      const commandModule = normalizeCommandModule(loaded);
+      this.command(commandModule);
+    });
+    this.commandDirLoads.push(...loads.map((load) => load.catch((error: unknown) => {
+      this.commandDirLoadError = error instanceof Error ? error : new Error(String(error));
+      throw this.commandDirLoadError;
+    })));
     return this;
   }
 
@@ -820,6 +824,7 @@ class Mcargs implements Argv {
     }
 
     try {
+      this.assertCommandDirsLoaded();
       const state = this.parseState(parseArgsInput ?? this.args);
       if (cb) cb(null, state.argv, state.output);
       return state.argv;
@@ -835,6 +840,7 @@ class Mcargs implements Argv {
   }
 
   async parseAsync(args?: string | string[]): Promise<Arguments> {
+    await this.loadCommandDirs();
     const argv = this.parse(args);
     await this.lastHandlerResult;
     return argv;
@@ -842,6 +848,21 @@ class Mcargs implements Argv {
 
   parseSync(args?: string | string[]): Arguments {
     return this.parse(args);
+  }
+
+  private async loadCommandDirs(): Promise<void> {
+    if (this.commandDirLoads.length === 0) return;
+    const loads = this.commandDirLoads;
+    this.commandDirLoads = [];
+    await Promise.all(loads);
+    if (this.commandDirLoadError) throw this.commandDirLoadError;
+  }
+
+  private assertCommandDirsLoaded(): void {
+    if (this.commandDirLoadError) throw this.commandDirLoadError;
+    if (this.commandDirLoads.length > 0) {
+      throw new McargsError('commandDir() loads CommonJS and ESM modules asynchronously; use parseAsync() after commandDir().', 'ERR_MCARGS_COMMAND_DIR_ASYNC');
+    }
   }
 
   private parseState(args: string[]): ParseState {
@@ -1510,6 +1531,11 @@ function cloneDefinition(definition: OptionDefinition): OptionDefinition {
 function optionNames(definition: OptionDefinition): string[] {
   return [definition.key, ...definition.aliases]
     .map((name) => (name.length === 1 ? `-${name}` : `--${name}`));
+}
+
+function normalizeCommandModule(loaded: CommandModule | { default?: CommandModule }): CommandModule {
+  if ('default' in loaded && loaded.default) return loaded.default;
+  return loaded as CommandModule;
 }
 
 function isDictionary(value: unknown): value is Dictionary {

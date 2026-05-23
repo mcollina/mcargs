@@ -44,7 +44,7 @@ The goal is drop-in source compatibility for Yargs users while keeping Node's `u
 - `parse()`, `parseSync()`, and the `argv` getter
 - `hideBin()` helper, also available from `mcargs/helpers`
 
-The full public Yargs method surface is present, including compatibility methods such as `middleware()`, `env()`, `config()`, `completion()`, and `commandDir()`. Some filesystem/configuration integrations are intentionally implemented as lightweight compatibility hooks rather than wrappers around Yargs.
+The full public Yargs method surface is present, including compatibility methods such as `middleware()`, `env()`, `config()`, `completion()`, and `commandDir()`. `commandDir()` uses dynamic `import()` so it can load both CommonJS and ESM command modules; use `parseAsync()` after `commandDir()`.
 
 ## Commands
 
