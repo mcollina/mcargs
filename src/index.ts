@@ -11,10 +11,13 @@ export interface Options {
   count?: boolean;
   default?: unknown;
   demandOption?: boolean | string;
+  deprecated?: string | boolean;
   describe?: string;
   description?: string;
   global?: boolean;
+  group?: string;
   hidden?: boolean;
+  nargs?: number;
   normalize?: boolean;
   number?: boolean;
   requiresArg?: boolean;
@@ -23,6 +26,8 @@ export interface Options {
 }
 
 export type OptionsMap = Record<string, Options | PrimitiveOptionType>;
+export type KeyInput = string | string[];
+export type Dictionary<T = unknown> = Record<string, T>;
 export type PositionalOptions = Omit<Options, 'alias'>;
 export type ParseCallback = (err: Error | null, argv: Arguments, output: string) => void;
 export type FailCallback = (message: string, error: Error, yargs: Argv) => void;
@@ -52,23 +57,48 @@ export interface Argv {
   choices(key: string, values: readonly unknown[]): this;
   coerce(key: string, fn: (value: unknown) => unknown): this;
   command(command: string | string[] | CommandModule, describe?: string | false, builder?: Builder, handler?: Handler): this;
+  addHelpOpt(option?: string | boolean, description?: string): this;
+  addShowHiddenOpt(option?: string | boolean, description?: string): this;
   commandDir(): this;
+  commands(command: string | string[] | CommandModule, describe?: string | false, builder?: Builder, handler?: Handler): this;
   completion(): this;
   config(): this;
+  conflicts(key: string | Dictionary<string | string[]>, value?: string | string[]): this;
   count(keys: string | string[]): this;
   default(key: string | Record<string, unknown>, value?: unknown): this;
+  defaults(key: string | Record<string, unknown>, value?: unknown): this;
+  demand(keys?: string | string[] | number, max?: number | string, msg?: string): this;
+  demandCommand(min?: number, max?: number, minMsg?: string, maxMsg?: string): this;
   demandOption(keys: string | string[], message?: string): this;
+  deprecateOption(key: string, message?: string): this;
   describe(key: string | Record<string, string>, description?: string): this;
   detectLocale(): this;
   env(): this;
   epilog(text: string): this;
+  epilogue(text: string): this;
   example(command: string, description: string): this;
+  exit(code?: number, error?: Error): void;
   exitProcess(enabled?: boolean): this;
   fail(fn: FailCallback): this;
+  getAliases(): Dictionary<string[]>;
+  getCompletion(args: string[], done: (completions: string[]) => void): void;
+  getDemandedCommands(): Dictionary<unknown>;
+  getDemandedOptions(): string[];
+  getDeprecatedOptions(): Dictionary<string | boolean>;
+  getDetectLocale(): boolean;
+  getExitProcess(): boolean;
+  getGroups(): Dictionary<string[]>;
   getHelp(): string;
+  getOptions(): Dictionary<unknown>;
+  getStrict(): boolean;
+  getStrictCommands(): boolean;
+  getStrictOptions(): boolean;
+  global(keys: string | string[], global?: boolean): this;
+  group(keys: string | string[], groupName: string): this;
   help(option?: string | boolean, description?: string): this;
-  implies(): this;
-  locale(): string;
+  hide(key: string): this;
+  implies(key: string | Dictionary<string | string[]>, value?: string | string[]): this;
+  locale(locale?: string): string | this;
   middleware(): this;
   nargs(): this;
   normalize(): this;
@@ -76,16 +106,28 @@ export interface Argv {
   option(key: string, options?: Options | PrimitiveOptionType): this;
   options(options: OptionsMap): this;
   parse(args?: string | string[] | ParseCallback, context?: unknown, callback?: ParseCallback): Arguments;
+  parseAsync(args?: string | string[]): Promise<Arguments>;
   parseSync(args?: string | string[]): Arguments;
   parserConfiguration(config: Record<string, unknown>): this;
   positional(key: string, options?: PositionalOptions): this;
   recommendCommands(): this;
+  require(keys?: string | string[] | number, max?: number | string, msg?: string): this;
   required(keys: string | string[], message?: string): this;
+  requiresArg(keys: string | string[]): this;
   scriptName(name: string): this;
+  showCompletionScript(output?: (message: string) => void): void;
   showHelp(output?: (message: string) => void): void;
+  showHelpOnFail(enabled?: boolean, message?: string): this;
+  showHidden(option?: string | boolean, description?: string): this;
+  showVersion(output?: (message: string) => void): void;
+  skipValidation(keys?: string | string[]): this;
   strict(enabled?: boolean): this;
+  strictCommands(enabled?: boolean): this;
+  strictOptions(enabled?: boolean): this;
   string(keys: string | string[]): this;
+  terminalWidth(width?: number): number;
   usage(message: string): this;
+  usageConfiguration(config: Dictionary): this;
   version(version?: string | boolean): this;
   wrap(): this;
 }
@@ -122,11 +164,13 @@ const noopMethods = new Set([
   'config',
   'detectLocale',
   'env',
-  'implies',
   'middleware',
   'nargs',
   'normalize',
+  'pkgConf',
   'recommendCommands',
+  'updateLocale',
+  'updateStrings',
   'wrap'
 ]);
 
@@ -147,26 +191,65 @@ class Mcargs implements Argv {
   private commands: CommandDefinition[] = [];
   private checks: CheckFunction[] = [];
   private examples: Array<{ command: string; description: string }> = [];
+  private conflictsMap = new Map<string, string[]>();
+  private implications = new Map<string, string[]>();
+  private demandedCommandMin?: number;
+  private demandedCommandMax?: number;
+  private demandedCommandMinMessage?: string;
+  private demandedCommandMaxMessage?: string;
+  private groupMap = new Map<string, string[]>();
+  private skippedValidation = new Set<string>();
   private usageMessage?: string;
   private epilogMessage?: string;
   private failCallback?: FailCallback;
   private processExit = false;
   private strictMode = false;
+  private strictOptionMode = false;
+  private strictCommandMode = false;
+  private showHiddenOptions = false;
+  private detectLocaleEnabled = true;
+  private localeValue = 'en';
+  private showHelpOnFailEnabled = true;
+  private showHelpOnFailMessage?: string;
+  private completionCommand = 'completion';
+  private wrapWidth?: number;
+  private lastHandlerResult?: void | Promise<void>;
   private script = process.argv[1] ? process.argv[1].split('/').at(-1) ?? '$0' : '$0';
   private helpOption?: string;
   private versionOption?: string;
   private versionValue?: string;
-  private parserConfig: Record<string, unknown> = {};
+  private parserConfig: Record<string, unknown> = { 'camel-case-expansion': true, 'dot-notation': true, 'boolean-negation': true, 'populate--': true };
 
   constructor(args: string[] = process.argv.slice(2)) {
     this.args = [...args];
+  }
+
+  get $0(): string {
+    return this.script;
+  }
+
+  get customScriptName(): boolean {
+    return this.script !== (process.argv[1] ? process.argv[1].split('/').at(-1) ?? '$0' : '$0');
+  }
+
+  get parsed(): Arguments {
+    return this.parseSync();
   }
 
   get argv(): Arguments {
     return this.parseSync();
   }
 
-  option(key: string, options: Options | PrimitiveOptionType = {}): this {
+  option(key: string | string[] | OptionsMap, options: Options | PrimitiveOptionType = {}): this {
+    if (Array.isArray(key)) {
+      for (const name of key) this.option(name, options);
+      return this;
+    }
+
+    if (typeof key === 'object') {
+      return this.options(key);
+    }
+
     const incoming = normalizeOptions(options);
     const previous = this.definitions.get(key);
     const aliases = unique([...(previous?.aliases ?? []), ...asArray(incoming.alias)]);
@@ -188,7 +271,12 @@ class Mcargs implements Argv {
     return this;
   }
 
-  alias(key: string, aliases: string | string[]): this {
+  alias(key: string | Dictionary<string | string[]>, aliases?: string | string[]): this {
+    if (typeof key === 'object') {
+      for (const [name, aliasValue] of Object.entries(key)) this.alias(name, aliasValue);
+      return this;
+    }
+
     const definition = this.ensureOption(key);
     definition.aliases = unique([...definition.aliases, ...asArray(aliases)]);
     return this;
@@ -209,6 +297,10 @@ class Mcargs implements Argv {
     return this;
   }
 
+  defaults(key: string | Record<string, unknown>, value?: unknown): this {
+    return this.default(key, value);
+  }
+
   describe(key: string | Record<string, string>, description?: string): this {
     if (typeof key === 'string') {
       this.ensureOption(key).describe = description;
@@ -227,17 +319,55 @@ class Mcargs implements Argv {
     return this;
   }
 
+  demand(keys?: string | string[] | number, max?: number | string, msg?: string): this {
+    if (typeof keys === 'number') return this.demandCommand(keys, typeof max === 'number' ? max : undefined, typeof max === 'string' ? max : msg);
+    if (keys === undefined) return this.demandCommand(1);
+    return this.demandOption(keys, typeof max === 'string' ? max : msg);
+  }
+
+  require(keys?: string | string[] | number, max?: number | string, msg?: string): this {
+    return this.demand(keys, max, msg);
+  }
+
+  demandCommand(min = 1, max?: number, minMsg?: string, maxMsg?: string): this {
+    this.demandedCommandMin = min;
+    this.demandedCommandMax = max;
+    this.demandedCommandMinMessage = minMsg;
+    this.demandedCommandMaxMessage = maxMsg;
+    return this;
+  }
+
   required(keys: string | string[], message?: string): this {
     return this.demandOption(keys, message);
   }
 
-  choices(key: string, values: readonly unknown[]): this {
-    this.ensureOption(key).choices = values;
+  requiresArg(keys: string | string[]): this {
+    for (const key of asArray(keys)) this.ensureOption(key).requiresArg = true;
     return this;
   }
 
-  coerce(key: string, fn: (value: unknown) => unknown): this {
-    this.ensureOption(key).coerce = fn;
+  deprecateOption(key: string, message: string | boolean = true): this {
+    this.ensureOption(key).deprecated = message;
+    return this;
+  }
+
+  choices(key: string | Dictionary<readonly unknown[]>, values?: readonly unknown[]): this {
+    if (typeof key === 'object') {
+      for (const [name, choiceValues] of Object.entries(key)) this.choices(name, choiceValues);
+      return this;
+    }
+
+    this.ensureOption(key).choices = values ?? [];
+    return this;
+  }
+
+  coerce(key: string | Dictionary<(value: unknown) => unknown>, fn?: (value: unknown) => unknown): this {
+    if (typeof key === 'object') {
+      for (const [name, coerceFn] of Object.entries(key)) this.coerce(name, coerceFn);
+      return this;
+    }
+
+    if (fn) this.ensureOption(key).coerce = fn;
     return this;
   }
 
@@ -261,6 +391,41 @@ class Mcargs implements Argv {
     return this.setType(keys, 'count');
   }
 
+  global(keys: string | string[], global = true): this {
+    for (const key of asArray(keys)) this.ensureOption(key).global = global;
+    return this;
+  }
+
+  group(keys: string | string[], groupName: string): this {
+    const entries = asArray(keys);
+    this.groupMap.set(groupName, unique([...(this.groupMap.get(groupName) ?? []), ...entries]));
+    for (const key of entries) this.ensureOption(key).group = groupName;
+    return this;
+  }
+
+  hide(key: string): this {
+    this.ensureOption(key).hidden = true;
+    return this;
+  }
+
+  conflicts(key: string | Dictionary<string | string[]>, value?: string | string[]): this {
+    if (typeof key === 'object') {
+      for (const [name, conflictsWith] of Object.entries(key)) this.conflicts(name, conflictsWith);
+      return this;
+    }
+    this.conflictsMap.set(key, unique([...(this.conflictsMap.get(key) ?? []), ...asArray(value)]));
+    return this;
+  }
+
+  implies(key: string | Dictionary<string | string[]>, value?: string | string[]): this {
+    if (typeof key === 'object') {
+      for (const [name, implied] of Object.entries(key)) this.implies(name, implied);
+      return this;
+    }
+    this.implications.set(key, unique([...(this.implications.get(key) ?? []), ...asArray(value)]));
+    return this;
+  }
+
   command(command: string | string[] | CommandModule, describe?: string | false, builder?: Builder, handler?: Handler): this {
     if (typeof command === 'object' && !Array.isArray(command)) {
       const module = command;
@@ -272,6 +437,10 @@ class Mcargs implements Argv {
 
     this.commands.push(makeCommand(command, describe, builder, handler));
     return this;
+  }
+
+  commands(command: string | string[] | CommandModule, describe?: string | false, builder?: Builder, handler?: Handler): this {
+    return this.command(command, describe, builder, handler);
   }
 
   positional(key: string, options: PositionalOptions = {}): this {
@@ -292,6 +461,20 @@ class Mcargs implements Argv {
 
   strict(enabled = true): this {
     this.strictMode = enabled;
+    this.strictOptionMode = enabled;
+    this.strictCommandMode = enabled;
+    return this;
+  }
+
+  strictOptions(enabled = true): this {
+    this.strictOptionMode = enabled;
+    this.strictMode = enabled || this.strictCommandMode;
+    return this;
+  }
+
+  strictCommands(enabled = true): this {
+    this.strictCommandMode = enabled;
+    this.strictMode = enabled || this.strictOptionMode;
     return this;
   }
 
@@ -310,6 +493,20 @@ class Mcargs implements Argv {
     this.helpOption = typeof option === 'string' ? option : 'help';
     this.option(this.helpOption, { type: 'boolean', describe: description });
     return this;
+  }
+
+  addHelpOpt(option: string | boolean = 'help', description = 'Show help'): this {
+    return this.help(option, description);
+  }
+
+  showHidden(option: string | boolean = 'show-hidden', description = 'Show hidden options'): this {
+    this.showHiddenOptions = true;
+    if (option !== false) this.option(typeof option === 'string' ? option : 'show-hidden', { type: 'boolean', describe: description });
+    return this;
+  }
+
+  addShowHiddenOpt(option: string | boolean = 'show-hidden', description = 'Show hidden options'): this {
+    return this.showHidden(option, description);
   }
 
   version(version: string | boolean = '0.0.0'): this {
@@ -331,6 +528,10 @@ class Mcargs implements Argv {
     return this;
   }
 
+  usageConfiguration(_config: Dictionary): this {
+    return this;
+  }
+
   example(command: string, description: string): this {
     this.examples.push({ command, description });
     return this;
@@ -339,6 +540,10 @@ class Mcargs implements Argv {
   epilog(text: string): this {
     this.epilogMessage = text;
     return this;
+  }
+
+  epilogue(text: string): this {
+    return this.epilog(text);
   }
 
   scriptName(name: string): this {
@@ -351,8 +556,96 @@ class Mcargs implements Argv {
     return this;
   }
 
-  locale(): string {
-    return 'en';
+  exit(code = 0, error?: Error): void {
+    if (error) throw error;
+    process.exit(code);
+  }
+
+  locale(locale?: string): string | this {
+    if (locale === undefined) return this.localeValue;
+    this.localeValue = locale;
+    return this;
+  }
+
+  terminalWidth(width?: number): number {
+    if (width !== undefined) this.wrapWidth = width;
+    return this.wrapWidth ?? process.stdout.columns ?? 80;
+  }
+
+  getAliases(): Dictionary<string[]> {
+    const aliases: Dictionary<string[]> = {};
+    for (const definition of this.definitions.values()) aliases[definition.key] = [...definition.aliases];
+    return aliases;
+  }
+
+  getCompletion(_args: string[], done: (completions: string[]) => void): void {
+    const completions = [
+      ...this.commands.flatMap((command) => command.names),
+      ...[...this.definitions.values()].flatMap((definition) => optionNames(definition))
+    ];
+    done(unique(completions));
+  }
+
+  getDemandedCommands(): Dictionary<unknown> {
+    return { min: this.demandedCommandMin, max: this.demandedCommandMax };
+  }
+
+  getDemandedOptions(): string[] {
+    return [...this.definitions.values()].filter((definition) => definition.demandOption).map((definition) => definition.key);
+  }
+
+  getDeprecatedOptions(): Dictionary<string | boolean> {
+    const deprecated: Dictionary<string | boolean> = {};
+    for (const definition of this.definitions.values()) {
+      if (definition.deprecated) deprecated[definition.key] = definition.deprecated;
+    }
+    return deprecated;
+  }
+
+  getDetectLocale(): boolean {
+    return this.detectLocaleEnabled;
+  }
+
+  getExitProcess(): boolean {
+    return this.processExit;
+  }
+
+  getGroups(): Dictionary<string[]> {
+    return Object.fromEntries(this.groupMap);
+  }
+
+  getInternalMethods(): Dictionary<unknown> {
+    return {
+      getCommandInstance: () => this.commands,
+      getContext: () => ({}),
+      getUsageInstance: () => this.getHelp(),
+      runCommand: (command: string) => this.parse([command]),
+      setHasOutput: () => undefined
+    };
+  }
+
+  getOptions(): Dictionary<unknown> {
+    return {
+      alias: this.getAliases(),
+      array: keysOfType(this.definitions, 'array'),
+      boolean: keysOfType(this.definitions, 'boolean'),
+      count: keysOfType(this.definitions, 'count'),
+      default: Object.fromEntries([...this.definitions.values()].filter((definition) => definition.default !== undefined).map((definition) => [definition.key, definition.default])),
+      number: keysOfType(this.definitions, 'number'),
+      string: keysOfType(this.definitions, 'string')
+    };
+  }
+
+  getStrict(): boolean {
+    return this.strictMode;
+  }
+
+  getStrictCommands(): boolean {
+    return this.strictCommandMode;
+  }
+
+  getStrictOptions(): boolean {
+    return this.strictOptionMode;
   }
 
   getHelp(): string {
@@ -367,7 +660,7 @@ class Mcargs implements Argv {
       }
     }
 
-    const visible = [...this.definitions.values()].filter((definition) => !definition.hidden);
+    const visible = [...this.definitions.values()].filter((definition) => this.showHiddenOptions || !definition.hidden);
     if (visible.length > 0) {
       lines.push('', 'Options:');
       for (const definition of visible) {
@@ -395,6 +688,25 @@ class Mcargs implements Argv {
 
   showHelp(output: (message: string) => void = console.log): void {
     output(this.getHelp());
+  }
+
+  showCompletionScript(output: (message: string) => void = console.log): void {
+    output(`# ${this.script} completion\n${this.script} ${this.completionCommand}`);
+  }
+
+  showHelpOnFail(enabled = true, message?: string): this {
+    this.showHelpOnFailEnabled = enabled;
+    this.showHelpOnFailMessage = message;
+    return this;
+  }
+
+  showVersion(output: (message: string) => void = console.log): void {
+    output(`${this.versionValue ?? '0.0.0'}\n`);
+  }
+
+  skipValidation(keys: string | string[] = []): this {
+    for (const key of asArray(keys)) this.skippedValidation.add(key);
+    return this;
   }
 
   parse(args?: string | string[] | ParseCallback, _context?: unknown, callback?: ParseCallback): Arguments {
@@ -426,6 +738,12 @@ class Mcargs implements Argv {
     }
   }
 
+  async parseAsync(args?: string | string[]): Promise<Arguments> {
+    const argv = this.parse(args);
+    await this.lastHandlerResult;
+    return argv;
+  }
+
   parseSync(args?: string | string[]): Arguments {
     return this.parse(args);
   }
@@ -450,7 +768,7 @@ class Mcargs implements Argv {
         }
         state.argv[positional.key] = coerceValue(positional.key, value, positional);
       }
-      if (command.handler) command.handler(state.argv);
+      if (command.handler) this.lastHandlerResult = command.handler(state.argv);
       return { ...state, command };
     }
 
@@ -458,15 +776,17 @@ class Mcargs implements Argv {
   }
 
   private parseWithoutCommand(args: string[]): ParseState {
-    const optionConfig = this.toParseArgsOptions();
+    const knownOptions = this.toParseArgsOptions();
+    const optionConfig = this.strictOptionMode ? knownOptions : discoverUnknownOptions(args, knownOptions);
     let parsed;
     try {
       parsed = parseArgs({
         args,
         options: optionConfig,
         allowPositionals: true,
-        strict: this.strictMode,
-        tokens: true
+        strict: this.strictOptionMode,
+        tokens: true,
+        allowNegative: this.parserConfig['boolean-negation'] !== false
       });
     } catch (error) {
       if (error instanceof Error) {
@@ -511,7 +831,7 @@ class Mcargs implements Argv {
 
     for (const [key, value] of Object.entries(values)) {
       if (consumed.has(key) || isImplicitAliasOfKnownOption(key, this.definitions)) continue;
-      setArgvValue(argv, key, value);
+      setArgvValue(argv, key, coerceUnknownValue(value));
     }
 
     argv._ = parsed.positionals.map(toPositionalValue);
@@ -519,6 +839,11 @@ class Mcargs implements Argv {
     if (dashDash && this.parserConfig['populate--'] !== false) {
       argv['--'] = dashDash;
     }
+
+    this.validateCommands(argv);
+    this.validateRequiredArgs(argv);
+    this.validateConflicts(argv);
+    this.validateImplications(argv);
 
     for (const check of this.checks) {
       const result = check(argv);
@@ -554,11 +879,28 @@ class Mcargs implements Argv {
     child.commands = [];
     child.checks = [...this.checks];
     child.examples = [...this.examples];
+    child.conflictsMap = new Map([...this.conflictsMap].map(([key, value]) => [key, [...value]]));
+    child.implications = new Map([...this.implications].map(([key, value]) => [key, [...value]]));
+    child.demandedCommandMin = this.demandedCommandMin;
+    child.demandedCommandMax = this.demandedCommandMax;
+    child.demandedCommandMinMessage = this.demandedCommandMinMessage;
+    child.demandedCommandMaxMessage = this.demandedCommandMaxMessage;
+    child.groupMap = new Map([...this.groupMap].map(([key, value]) => [key, [...value]]));
+    child.skippedValidation = new Set(this.skippedValidation);
     child.usageMessage = this.usageMessage;
     child.epilogMessage = this.epilogMessage;
     child.failCallback = this.failCallback;
     child.processExit = this.processExit;
     child.strictMode = this.strictMode;
+    child.strictOptionMode = this.strictOptionMode;
+    child.strictCommandMode = this.strictCommandMode;
+    child.showHiddenOptions = this.showHiddenOptions;
+    child.detectLocaleEnabled = this.detectLocaleEnabled;
+    child.localeValue = this.localeValue;
+    child.showHelpOnFailEnabled = this.showHelpOnFailEnabled;
+    child.showHelpOnFailMessage = this.showHelpOnFailMessage;
+    child.completionCommand = this.completionCommand;
+    child.wrapWidth = this.wrapWidth;
     child.script = this.script;
     child.helpOption = this.helpOption;
     child.versionOption = this.versionOption;
@@ -612,6 +954,51 @@ class Mcargs implements Argv {
 
     return options;
   }
+
+  private validateCommands(argv: Arguments): void {
+    if (this.skippedValidation.has('$0')) return;
+    const commandCount = argv._.filter((value) => this.commands.some((command) => command.names.includes(String(value)))).length;
+    if (this.demandedCommandMin !== undefined && commandCount < this.demandedCommandMin) {
+      throw new McargsError(this.demandedCommandMinMessage ?? `Not enough non-option arguments: got ${commandCount}, need at least ${this.demandedCommandMin}`, 'ERR_MCARGS_MISSING_COMMAND');
+    }
+    if (this.demandedCommandMax !== undefined && commandCount > this.demandedCommandMax) {
+      throw new McargsError(this.demandedCommandMaxMessage ?? `Too many non-option arguments: got ${commandCount}, maximum of ${this.demandedCommandMax}`, 'ERR_MCARGS_TOO_MANY_COMMANDS');
+    }
+    if (this.strictCommandMode && this.commands.length > 0 && argv._.length > 0) {
+      const commandName = String(argv._[0]);
+      if (!this.commands.some((command) => command.names.includes(commandName))) {
+        throw new McargsError(`Unknown command: ${commandName}`, 'ERR_MCARGS_UNKNOWN_COMMAND');
+      }
+    }
+  }
+
+  private validateRequiredArgs(argv: Arguments): void {
+    for (const definition of this.definitions.values()) {
+      if (!definition.requiresArg || this.skippedValidation.has(definition.key)) continue;
+      const value = argv[definition.key];
+      if (value === true || value === undefined || value === '') {
+        throw new McargsError(`Argument ${definition.key} requires an argument`, 'ERR_MCARGS_REQUIRES_ARG');
+      }
+    }
+  }
+
+  private validateConflicts(argv: Arguments): void {
+    for (const [key, conflictsWith] of this.conflictsMap) {
+      if (argv[key] === undefined || this.skippedValidation.has(key)) continue;
+      for (const other of conflictsWith) {
+        if (argv[other] !== undefined) throw new McargsError(`Arguments ${key} and ${other} are mutually exclusive`, 'ERR_MCARGS_CONFLICTS');
+      }
+    }
+  }
+
+  private validateImplications(argv: Arguments): void {
+    for (const [key, implied] of this.implications) {
+      if (argv[key] === undefined || this.skippedValidation.has(key)) continue;
+      for (const other of implied) {
+        if (argv[other] === undefined) throw new McargsError(`Argument ${key} implies ${other}`, 'ERR_MCARGS_IMPLIES');
+      }
+    }
+  }
 }
 
 for (const method of noopMethods) {
@@ -635,6 +1022,46 @@ export default yargs;
 function normalizeOptions(options: Options | PrimitiveOptionType): Options {
   if (typeof options === 'string') return { type: options };
   return { ...options };
+}
+
+function keysOfType(definitions: Map<string, OptionDefinition>, type: PrimitiveOptionType): string[] {
+  return [...definitions.values()].filter((definition) => definition.type === type).map((definition) => definition.key);
+}
+
+function discoverUnknownOptions(
+  args: string[],
+  known: Record<string, { type: 'string' | 'boolean'; multiple?: boolean; short?: string }>
+): Record<string, { type: 'string' | 'boolean'; multiple?: boolean; short?: string }> {
+  const options = structuredClone(known);
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]!;
+    if (arg === '--') break;
+    if (!arg.startsWith('-') || arg === '-') continue;
+
+    if (arg.startsWith('--no-')) {
+      const name = arg.slice(5);
+      if (!options[name]) options[name] = { type: 'boolean' };
+      continue;
+    }
+
+    if (arg.startsWith('--')) {
+      const [rawName, inlineValue] = arg.slice(2).split(/=(.*)/s, 2);
+      const name = rawName!;
+      if (!name || options[name]) continue;
+      const next = args[index + 1];
+      options[name] = { type: inlineValue !== undefined || (next !== undefined && !next.startsWith('-')) ? 'string' : 'boolean' };
+      continue;
+    }
+
+    const shorts = arg.slice(1).split('');
+    for (const shortName of shorts) {
+      const existing = Object.values(options).some((option) => option.short === shortName) || options[shortName];
+      if (existing) continue;
+      const next = args[index + 1];
+      options[shortName] = { type: shorts.length === 1 && next !== undefined && !next.startsWith('-') ? 'string' : 'boolean', short: shortName };
+    }
+  }
+  return options;
 }
 
 function inferType(options: Options, fallback: PrimitiveOptionType = 'boolean'): PrimitiveOptionType {
@@ -695,8 +1122,20 @@ function isImplicitAliasOfKnownOption(key: string, definitions: Map<string, Opti
 
 function setArgvValue(argv: Arguments, key: string, value: unknown): void {
   argv[key] = value;
+  if (key.includes('.')) setDottedValue(argv, key, value);
   const camel = camelCase(key);
   if (camel !== key) argv[camel] = value;
+}
+
+function setDottedValue(argv: Arguments, key: string, value: unknown): void {
+  const parts = key.split('.').filter(Boolean);
+  if (parts.length < 2) return;
+  let cursor: Record<string, unknown> = argv;
+  for (const part of parts.slice(0, -1)) {
+    if (typeof cursor[part] !== 'object' || cursor[part] === null || Array.isArray(cursor[part])) cursor[part] = {};
+    cursor = cursor[part] as Record<string, unknown>;
+  }
+  cursor[parts.at(-1)!] = value;
 }
 
 function coerceValue(key: string, value: unknown, definition: Options & { type: PrimitiveOptionType }): unknown {
@@ -725,6 +1164,12 @@ function coerceValue(key: string, value: unknown, definition: Options & { type: 
   return coerced;
 }
 
+function coerceUnknownValue(value: unknown): unknown {
+  if (typeof value === 'string') return toPositionalValue(value);
+  if (Array.isArray(value)) return value.map(coerceUnknownValue);
+  return value;
+}
+
 function toNumber(key: string, value: unknown): number {
   const number = Number(value);
   if (Number.isNaN(number)) throw new McargsError(`Invalid number for ${key}: ${String(value)}`, 'ERR_MCARGS_NUMBER');
@@ -741,7 +1186,7 @@ function firstPositionalToken(
   strict: boolean
 ): { value: string; index: number } | undefined {
   try {
-    const parsed = parseArgs({ args, options, strict, allowPositionals: true, tokens: true });
+    const parsed = parseArgs({ args, options, strict, allowPositionals: true, tokens: true, allowNegative: true });
     const token = parsed.tokens.find((entry) => entry.kind === 'positional');
     return token && 'value' in token ? { value: token.value, index: token.index } : undefined;
   } catch {

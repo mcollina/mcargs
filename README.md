@@ -1,6 +1,6 @@
 # mcargs
 
-`mcargs` is a small ESM, type-stripped TypeScript argument parser with a Yargs-like chainable API. Internally it delegates tokenization and option parsing to Node.js [`util.parseArgs()`](https://nodejs.org/api/util.html#utilparseargsconfig).
+`mcargs` is an ESM, type-stripped TypeScript argument parser that aims to be a drop-in Yargs replacement. Internally it delegates tokenization and option parsing to Node.js [`util.parseArgs()`](https://nodejs.org/api/util.html#utilparseargsconfig), not to Yargs or yargs-parser.
 
 ## Requirements
 
@@ -31,7 +31,7 @@ console.log(argv.name, argv.port)
 
 ## Yargs-compatible API
 
-The goal is source familiarity for common Yargs usage while keeping Node's `util.parseArgs()` as the parsing engine. Supported methods include:
+The goal is drop-in source compatibility for Yargs users while keeping Node's `util.parseArgs()` as the parsing engine. Supported methods include:
 
 - `option()`, `options()`
 - `alias()`, `default()`, `describe()`
@@ -44,7 +44,7 @@ The goal is source familiarity for common Yargs usage while keeping Node's `util
 - `parse()`, `parseSync()`, and the `argv` getter
 - `hideBin()` helper, also available from `mcargs/helpers`
 
-Some advanced Yargs features are intentionally lightweight or no-op placeholders for compatibility, such as `middleware()`, `env()`, `config()`, `completion()`, and `commandDir()`.
+The full public Yargs method surface is present, including compatibility methods such as `middleware()`, `env()`, `config()`, `completion()`, and `commandDir()`. Some filesystem/configuration integrations are intentionally implemented as lightweight compatibility hooks rather than wrappers around Yargs.
 
 ## Commands
 
@@ -63,7 +63,8 @@ const argv = yargs(['serve', '8080', '--host', '127.0.0.1'])
 ## Helpers subpath
 
 ```js
-import { hideBin } from 'mcargs/helpers'
+import yargs from 'mcargs/yargs'
+import { hideBin, Parser, applyExtends } from 'mcargs/helpers'
 ```
 
 ## Development
@@ -76,4 +77,4 @@ Tests use the built-in `node:test` runner.
 
 ## License and Yargs attribution
 
-`mcargs` is MIT licensed. It implements a Yargs-like interface, but no Yargs source code was copied or ported into this repository. If that changes in the future, this README should be updated and the Yargs license should be included as requested.
+`mcargs` is MIT licensed. It implements the Yargs public interface, but no Yargs source code was copied or ported into this repository, and Yargs is not used at runtime. Yargs is only used as a development-time compatibility oracle in tests. If source code is copied or ported in the future, this README should be updated and the Yargs license should be included as requested.
