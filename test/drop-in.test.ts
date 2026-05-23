@@ -20,6 +20,12 @@ function publicNames(instance: object): Set<string> {
   return names;
 }
 
+function stripScriptName<T extends Record<string, unknown>>(argv: T): Omit<T, '$0'> {
+  const copy = structuredClone(argv);
+  delete copy.$0;
+  return copy;
+}
+
 test('exposes the same public yargs method/property surface', () => {
   const expected = publicNames(realYargs([]));
   const actual = publicNames(yargs([]));
@@ -29,21 +35,68 @@ test('exposes the same public yargs method/property surface', () => {
 });
 
 test('matches yargs for common unknown option parsing', () => {
-  const args = ['--name', 'Ada', '--no-cache', '-v', '-v', '--nested.value', '42', 'file.txt'];
-  const expected = realYargs(args)
-    .exitProcess(false)
-    .count('v')
-    .parseSync();
-  const actual = yargs(args)
-    .exitProcess(false)
-    .count('v')
-    .parseSync();
+  const cases = [
+    ['--name', 'Ada', '--no-cache', '-v', '-v', '--nested.value', '42', 'file.txt'],
+    ['--foo=99'],
+    ['--foo', '001'],
+    ['--foo', '-1'],
+    ['-abc'],
+    ['-n5'],
+    ['-x=5'],
+    ['-vvv'],
+    ['--arr', '1', '--arr', '2'],
+    ['--x-y', '1', '--xY', '2'],
+    ['--', '--x', '1']
+  ];
 
-  assert.equal(actual.name, expected.name);
-  assert.equal(actual.cache, expected.cache);
-  assert.equal(actual.v, expected.v);
-  assert.deepEqual(actual.nested, expected.nested);
-  assert.deepEqual(actual._, expected._);
+  for (const args of cases) {
+    const expected = realYargs(args).exitProcess(false).parseSync();
+    const actual = yargs(args).exitProcess(false).parseSync();
+    assert.deepEqual(stripScriptName(actual), stripScriptName(expected), args.join(' '));
+  }
+});
+
+test('matches yargs parser configuration edge cases', () => {
+  const cases = [
+    { args: ['--', '--x', '1'], config: { 'populate--': true } },
+    { args: ['--x.y', '1'], config: { 'dot-notation': false } },
+    { args: ['--x-y', '1'], config: { 'camel-case-expansion': false } },
+    { args: ['1', '2'], config: { 'parse-positional-numbers': false } },
+    { args: ['--foo', '99'], config: { 'parse-numbers': false } },
+    { args: ['--x', '1', '--x', '2'], config: { 'duplicate-arguments-array': false } },
+    { args: ['-abc'], config: { 'short-option-groups': false } }
+  ];
+
+  for (const { args, config } of cases) {
+    const expected = realYargs(args).exitProcess(false).parserConfiguration(config).parseSync();
+    const actual = yargs(args).exitProcess(false).parserConfiguration(config).parseSync();
+    assert.deepEqual(stripScriptName(actual), stripScriptName(expected), `${args.join(' ')} ${JSON.stringify(config)}`);
+  }
+});
+
+test('matches yargs for typed option edge cases', () => {
+  const scenarios = [
+    { args: ['--foo'], setup: (cli) => cli.string('foo') },
+    { args: ['--foo'], setup: (cli) => cli.number('foo') },
+    { args: ['--foo', '1', '--foo', '2'], setup: (cli) => cli.array('foo') },
+    { args: ['--foo', '1', '2'], setup: (cli) => cli.nargs('foo', 2) },
+    { args: ['--foo'], setup: (cli) => cli.default('foo', 'bar') },
+    { args: ['--foo', 'bar'], setup: (cli) => cli.alias('foo', 'f') },
+    { args: ['--foo'], setup: (cli) => cli.alias('foo', 'f') },
+    { args: ['-f', 'bar'], setup: (cli) => cli.alias('foo', 'f') },
+    { args: ['--foo', 'bar'], setup: (cli) => cli.choices('foo', ['bar', 'baz']) },
+    { args: ['--foo', '1'], setup: (cli) => cli.coerce('foo', (value) => Number(value) + 1) },
+    { args: ['--arr', '1', '2'], setup: (cli) => cli.array('arr') },
+    { args: ['--arr', '1', '2'], setup: (cli) => cli.array('arr').parserConfiguration({ 'greedy-arrays': false }) },
+    { args: ['--foo', '1'], setup: (cli) => cli.alias('foo', 'f').parserConfiguration({ 'strip-aliased': true }) },
+    { args: ['--foo-bar', '1'], setup: (cli) => cli.parserConfiguration({ 'strip-dashed': true }) }
+  ];
+
+  for (const { args, setup } of scenarios) {
+    const expected = setup(realYargs(args).exitProcess(false)).parseSync();
+    const actual = setup(yargs(args).exitProcess(false)).parseSync();
+    assert.deepEqual(stripScriptName(actual), stripScriptName(expected), args.join(' '));
+  }
 });
 
 test('supports yargs/yargs and helpers subpath compatibility', () => {

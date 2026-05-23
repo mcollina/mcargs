@@ -349,6 +349,14 @@ Supported output helpers:
 | `boolean-negation` | `true` | Enables `--no-name` for booleans. |
 | `populate--` | `false` | When `true`, values after `--` are moved to `argv['--']`. |
 | `parse-positional-numbers` | `true` | Converts numeric positionals to numbers. |
+| `parse-numbers` | `true` | Converts numeric option values to numbers. |
+| `duplicate-arguments-array` | `true` | Repeated unknown options become arrays. |
+| `short-option-groups` | `true` | Treats `-abc` as `-a -b -c`; when false it becomes `--abc`. |
+| `greedy-arrays` | `true` | Array options consume following positional values until the next option. |
+| `nargs-eats-options` | `false` | Allows `nargs()` to consume dash-prefixed values. |
+| `strip-aliased` | `false` | Removes alias keys from the final result. |
+| `strip-dashed` | `false` | Removes dashed keys when camel-case expansion is enabled. |
+| `set-placeholder-key` | `false` | Adds `undefined` placeholders for configured options that were not set. |
 
 ```js
 const argv = yargs(['--no-cache', '--db.host', 'localhost'])

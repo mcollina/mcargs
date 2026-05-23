@@ -142,6 +142,7 @@ interface OptionDefinition extends Options {
   key: string;
   aliases: string[];
   type: PrimitiveOptionType;
+  generic: boolean;
 }
 
 interface PositionalDefinition extends PositionalOptions {
@@ -264,7 +265,8 @@ class Mcargs implements Argv {
       ...incoming,
       key,
       aliases,
-      type
+      type,
+      generic: previous?.generic ?? !hasExplicitType(incoming)
     });
     return this;
   }
@@ -292,11 +294,13 @@ class Mcargs implements Argv {
       const definition = this.ensureOption(key);
       definition.default = value;
       definition.type = typeFromDefault(value) ?? definition.type;
+      definition.generic = false;
     } else {
       for (const [name, defaultValue] of Object.entries(key)) {
         const definition = this.ensureOption(name);
         definition.default = defaultValue;
         definition.type = typeFromDefault(defaultValue) ?? definition.type;
+        definition.generic = false;
       }
     }
     return this;
@@ -362,7 +366,10 @@ class Mcargs implements Argv {
       return this;
     }
 
-    this.ensureOption(key).choices = values ?? [];
+    const definition = this.ensureOption(key);
+    definition.choices = values ?? [];
+    definition.generic = false;
+    if (definition.type === 'boolean' && !definition.boolean) definition.type = 'string';
     return this;
   }
 
@@ -372,7 +379,12 @@ class Mcargs implements Argv {
       return this;
     }
 
-    if (fn) this.ensureOption(key).coerce = fn;
+    if (fn) {
+      const definition = this.ensureOption(key);
+      definition.coerce = fn;
+      definition.generic = false;
+      if (definition.type === 'boolean' && !definition.boolean) definition.type = 'string';
+    }
     return this;
   }
 
@@ -532,6 +544,7 @@ class Mcargs implements Argv {
     }
     const definition = this.ensureOption(key);
     definition.nargs = count;
+    definition.generic = false;
     if (definition.type === 'boolean' && !definition.boolean) definition.type = 'string';
     return this;
   }
@@ -893,13 +906,14 @@ class Mcargs implements Argv {
   }
 
   private parseWithoutCommand(args: string[]): ParseState {
-    const expandedArgs = expandNargs(args, this.definitions);
-    const knownOptions = this.toParseArgsOptions();
-    const optionConfig = this.strictOptionMode ? knownOptions : discoverUnknownOptions(expandedArgs, knownOptions);
+    const expandedArgs = preprocessShortOptions(expandMultiValueOptions(args, this.definitions, this.parserConfig), this.parserConfig);
+    const knownOptions = this.toParseArgsOptions(expandedArgs);
+    const parseInput = fillMissingStringOptionValues(expandedArgs, this.definitions, knownOptions);
+    const optionConfig = this.strictOptionMode ? knownOptions : discoverUnknownOptions(parseInput, knownOptions, this.parserConfig);
     let parsed;
     try {
       parsed = parseArgs({
-        args: expandedArgs,
+        args: parseInput,
         options: optionConfig,
         allowPositionals: true,
         strict: this.strictOptionMode,
@@ -942,20 +956,20 @@ class Mcargs implements Argv {
         continue;
       }
 
-      value = coerceValue(definition.key, value, definition);
+      value = coerceValue(definition.key, value, definition, this.parserConfig);
       setArgvValue(argv, definition.key, value, this.parserConfig);
       for (const alias of definition.aliases) setArgvValue(argv, alias, value, this.parserConfig);
     }
 
     for (const [key, value] of Object.entries(values)) {
       if (consumed.has(key) || isImplicitAliasOfKnownOption(key, this.definitions)) continue;
-      setArgvValue(argv, key, coerceUnknownValue(value), this.parserConfig);
+      setUnknownArgvValue(argv, key, coerceUnknownValue(value, this.parserConfig), this.parserConfig);
     }
 
     argv._ = shouldParsePositionalNumbers(this.parserConfig) ? parsed.positionals.map(toPositionalValue) : parsed.positionals;
-    const dashDash = collectDashDash(expandedArgs);
+    const dashDash = collectDashDash(parseInput);
     if (dashDash && this.parserConfig['populate--'] === true) {
-      argv['--'] = dashDash;
+      argv['--'] = dashDash.map((value) => coerceUnknownValue(value, this.parserConfig)) as string[];
       argv._ = argv._.slice(0, Math.max(0, argv._.length - dashDash.length));
     }
 
@@ -985,12 +999,13 @@ class Mcargs implements Argv {
     }
 
     this.runMiddlewareSync(argv, this.middlewareAfterValidation);
+    this.applyResultConfiguration(argv);
 
     return { argv, output };
   }
 
   private findCommand(args: string[]): { command: CommandDefinition; index: number } | undefined {
-    const first = firstPositionalToken(args, this.toParseArgsOptions(), this.strictMode);
+    const first = firstPositionalToken(args, this.toParseArgsOptions(args), this.strictMode);
     if (!first) return undefined;
     const command = this.commands.find((candidate) => candidate.names.includes(first.value));
     return command ? { command, index: first.index } : undefined;
@@ -1052,7 +1067,7 @@ class Mcargs implements Argv {
   private ensureOption(key: string): OptionDefinition {
     const existing = this.definitions.get(key);
     if (existing) return existing;
-    const definition: OptionDefinition = { key, aliases: [], type: 'boolean' };
+    const definition: OptionDefinition = { key, aliases: [], type: 'boolean', generic: true };
     this.definitions.set(key, definition);
     return definition;
   }
@@ -1061,6 +1076,7 @@ class Mcargs implements Argv {
     for (const key of asArray(keys)) {
       const definition = this.ensureOption(key);
       definition.type = type;
+      definition.generic = false;
       if (type === 'array') definition.array = true;
       if (type === 'boolean') definition.boolean = true;
       if (type === 'count') definition.count = true;
@@ -1070,13 +1086,13 @@ class Mcargs implements Argv {
     return this;
   }
 
-  private toParseArgsOptions(): Record<string, { type: 'string' | 'boolean'; multiple?: boolean; short?: string }> {
+  private toParseArgsOptions(args: string[] = []): Record<string, { type: 'string' | 'boolean'; multiple?: boolean; short?: string }> {
     const options: Record<string, { type: 'string' | 'boolean'; multiple?: boolean; short?: string }> = {};
 
     for (const definition of this.definitions.values()) {
       for (const name of [definition.key, ...definition.aliases, ...implicitAliases(definition.key)]) {
         if (options[name]) continue;
-        const parseType = definition.type === 'boolean' || definition.type === 'count' ? 'boolean' : 'string';
+        const parseType = definition.generic ? genericParseType(args, definition) : definition.type === 'boolean' || definition.type === 'count' ? 'boolean' : 'string';
         options[name] = { type: parseType };
         if (definition.type === 'array' || definition.type === 'count' || definition.nargs !== undefined) options[name].multiple = true;
         if (name.length === 1) options[name].short = name;
@@ -1129,6 +1145,29 @@ class Mcargs implements Argv {
         continue;
       }
       if (isDictionary(result)) Object.assign(argv, result);
+    }
+  }
+
+  private applyResultConfiguration(argv: Arguments): void {
+    if (this.parserConfig['set-placeholder-key'] === true) {
+      for (const definition of this.definitions.values()) {
+        if (argv[definition.key] === undefined) argv[definition.key] = undefined;
+      }
+    }
+
+    if (this.parserConfig['strip-aliased'] === true) {
+      for (const definition of this.definitions.values()) {
+        for (const alias of definition.aliases) {
+          delete argv[alias];
+          delete argv[camelCase(alias)];
+        }
+      }
+    }
+
+    if (this.parserConfig['strip-dashed'] === true && this.parserConfig['camel-case-expansion'] !== false) {
+      for (const key of Object.keys(argv)) {
+        if (key.includes('-')) delete argv[key];
+      }
     }
   }
 
@@ -1210,10 +1249,11 @@ function keysOfType(definitions: Map<string, OptionDefinition>, type: PrimitiveO
 
 function discoverUnknownOptions(
   args: string[],
-  known: Record<string, { type: 'string' | 'boolean'; multiple?: boolean; short?: string }>
+  known: Record<string, { type: 'string' | 'boolean'; multiple?: boolean; short?: string }>,
+  config: Record<string, unknown> = {}
 ): Record<string, { type: 'string' | 'boolean'; multiple?: boolean; short?: string }> {
   const options = structuredClone(known);
-  const counts = countUnknownOptions(args, known);
+  const counts = config['duplicate-arguments-array'] === false ? new Map<string, number>() : countUnknownOptions(args, known);
 
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index]!;
@@ -1231,7 +1271,7 @@ function discoverUnknownOptions(
       const name = rawName!;
       if (!name || options[name]) continue;
       const next = args[index + 1];
-      options[name] = withMultiple({ type: inlineValue !== undefined || (next !== undefined && !next.startsWith('-')) ? 'string' : 'boolean' }, counts.get(name));
+      options[name] = withMultiple({ type: inlineValue !== undefined || (next !== undefined && (!next.startsWith('-') || isNegativeNumber(next))) ? 'string' : 'boolean' }, counts.get(name));
       continue;
     }
 
@@ -1240,7 +1280,7 @@ function discoverUnknownOptions(
       const existing = Object.values(options).some((option) => option.short === shortName) || options[shortName];
       if (existing) continue;
       const next = args[index + 1];
-      options[shortName] = withMultiple({ type: shorts.length === 1 && next !== undefined && !next.startsWith('-') ? 'string' : 'boolean', short: shortName }, counts.get(shortName));
+      options[shortName] = withMultiple({ type: shorts.length === 1 && next !== undefined && (!next.startsWith('-') || isNegativeNumber(next)) ? 'string' : 'boolean', short: shortName }, counts.get(shortName));
     }
   }
   return options;
@@ -1269,6 +1309,18 @@ function countUnknownOptions(args: string[], known: Record<string, { type: 'stri
 function withMultiple<T extends { multiple?: boolean }>(option: T, count = 0): T {
   if (count > 1) option.multiple = true;
   return option;
+}
+
+function isNegativeNumber(value: string): boolean {
+  return /^-\d+(?:\.\d+)?$/u.test(value);
+}
+
+function hasExplicitType(options: Options): boolean {
+  return Boolean(options.type || options.array || options.count || options.number || options.string || options.boolean);
+}
+
+function genericParseType(args: string[], definition: OptionDefinition): 'string' | 'boolean' {
+  return hasOptionValue(args, definition) ? 'string' : 'boolean';
 }
 
 function inferType(options: Options, fallback: PrimitiveOptionType = 'boolean'): PrimitiveOptionType {
@@ -1300,6 +1352,20 @@ function asArray<T>(value: T | T[] | undefined): T[] {
 
 function shouldParsePositionalNumbers(config: Record<string, unknown>): boolean {
   return config['parse-positional-numbers'] !== false;
+}
+
+function hasOptionValue(args: string[], definition: OptionDefinition): boolean {
+  const names = new Set([definition.key, ...definition.aliases, ...implicitAliases(definition.key)]);
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]!;
+    if (arg === '--') return false;
+    const name = optionNameFromArg(arg);
+    if (!name || !names.has(name)) continue;
+    if (arg.includes('=')) return true;
+    const next = args[index + 1];
+    return next !== undefined && (!next.startsWith('-') || isNegativeNumber(next));
+  }
+  return false;
 }
 
 function splitArgs(args: string | string[]): string[] {
@@ -1348,6 +1414,30 @@ function setDefaultArgvValue(argv: Arguments, key: string, value: unknown, defin
   for (const alias of definition?.aliases ?? []) setArgvValue(argv, alias, coerced);
 }
 
+function setUnknownArgvValue(argv: Arguments, key: string, value: unknown, config: Record<string, unknown>): void {
+  const related = relatedKeys(argv, key, config);
+  const existingKey = related.find((candidate) => argv[candidate] !== undefined);
+  const finalValue = existingKey ? mergeArgValues(argv[existingKey], value) : value;
+  setArgvValue(argv, key, finalValue, config);
+  for (const candidate of related) {
+    if (candidate !== key && argv[candidate] !== undefined) setArgvValue(argv, candidate, finalValue, config);
+  }
+}
+
+function relatedKeys(argv: Arguments, key: string, config: Record<string, unknown>): string[] {
+  if (config['camel-case-expansion'] === false) return [key];
+  const camel = camelCase(key);
+  const keys = new Set([key, camel]);
+  for (const existing of Object.keys(argv)) {
+    if (camelCase(existing) === camel) keys.add(existing);
+  }
+  return [...keys];
+}
+
+function mergeArgValues(existing: unknown, value: unknown): unknown[] {
+  return [...(Array.isArray(existing) ? existing : [existing]), ...(Array.isArray(value) ? value : [value])];
+}
+
 function setDottedValue(argv: Arguments, key: string, value: unknown): void {
   const parts = key.split('.').filter(Boolean);
   if (parts.length < 2) return;
@@ -1359,16 +1449,25 @@ function setDottedValue(argv: Arguments, key: string, value: unknown): void {
   cursor[parts.at(-1)!] = value;
 }
 
-function coerceValue(key: string, value: unknown, definition: Options & { type: PrimitiveOptionType }): unknown {
+function coerceValue(key: string, value: unknown, definition: Options & { type: PrimitiveOptionType; generic?: boolean }, config: Record<string, unknown> = {}): unknown {
   let coerced = value;
+
+  if (definition.generic && typeof coerced === 'string') {
+    coerced = coerceUnknownValue(coerced, config);
+  }
 
   if (definition.type === 'array') {
     coerced = Array.isArray(coerced) ? coerced : [coerced];
+    if (!definition.string) coerced = coerced.map((entry) => coerceUnknownValue(entry, config));
+  } else if (definition.nargs !== undefined && Array.isArray(coerced) && !definition.string) {
+    coerced = coerced.map((entry) => coerceUnknownValue(entry, config));
   } else if (definition.type === 'count') {
     coerced = Array.isArray(coerced) ? coerced.length : coerced === undefined ? 0 : 1;
   } else if (definition.type === 'number') {
     if (Array.isArray(coerced)) {
       coerced = coerced.map((entry) => toNumber(key, entry));
+    } else if (coerced === '') {
+      coerced = undefined;
     } else {
       coerced = toNumber(key, coerced);
     }
@@ -1390,9 +1489,14 @@ function coerceValue(key: string, value: unknown, definition: Options & { type: 
   return coerced;
 }
 
-function coerceUnknownValue(value: unknown): unknown {
-  if (typeof value === 'string') return toPositionalValue(value);
-  if (Array.isArray(value)) return value.map(coerceUnknownValue);
+function coerceUnknownValue(value: unknown, config: Record<string, unknown> = {}): unknown {
+  if (typeof value === 'string') return config['parse-numbers'] === false ? value : toUnknownNumberOrString(value);
+  if (Array.isArray(value)) return value.map((entry) => coerceUnknownValue(entry, config));
+  return value;
+}
+
+function toUnknownNumberOrString(value: string): string | number {
+  if (/^-?(?:0|[1-9]\d*)(?:\.\d+)?$/u.test(value)) return Number(value);
   return value;
 }
 
@@ -1433,7 +1537,63 @@ function collectDashDash(args: string[]): string[] | undefined {
   return args.slice(index + 1);
 }
 
-function expandNargs(args: string[], definitions: Map<string, OptionDefinition>): string[] {
+function fillMissingStringOptionValues(
+  args: string[],
+  definitions: Map<string, OptionDefinition>,
+  options: Record<string, { type: 'string' | 'boolean'; multiple?: boolean; short?: string }>
+): string[] {
+  const byName = new Map<string, OptionDefinition>();
+  for (const definition of definitions.values()) {
+    for (const name of [definition.key, ...definition.aliases, ...implicitAliases(definition.key)]) byName.set(name, definition);
+  }
+
+  const result: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]!;
+    result.push(arg);
+    if (arg === '--') {
+      result.push(...args.slice(index + 1));
+      break;
+    }
+    const name = optionNameFromArg(arg);
+    if (!name || arg.includes('=')) continue;
+    const option = options[name] ?? Object.values(options).find((candidate) => candidate.short === name);
+    if (option?.type !== 'string') continue;
+    const next = args[index + 1];
+    if (next === undefined || (next.startsWith('-') && !isNegativeNumber(next))) {
+      const definition = byName.get(name);
+      result.push(definition?.default === undefined ? '' : String(definition.default));
+    }
+  }
+  return result;
+}
+
+function preprocessShortOptions(args: string[], config: Record<string, unknown> = {}): string[] {
+  const result: string[] = [];
+  for (const arg of args) {
+    if (config['short-option-groups'] === false && /^-[^-].{1,}/u.test(arg) && !/^-[^-=][=-]/u.test(arg)) {
+      result.push(`--${arg.slice(1)}`);
+      continue;
+    }
+
+    const equals = arg.match(/^-([^-=])=(.*)$/u);
+    if (equals) {
+      result.push(`-${equals[1]}`, equals[2] ?? '');
+      continue;
+    }
+
+    const attachedNumber = arg.match(/^-([^-=])(-?(?:0|[1-9]\d*)(?:\.\d+)?)$/u);
+    if (attachedNumber) {
+      result.push(`-${attachedNumber[1]}`, attachedNumber[2] ?? '');
+      continue;
+    }
+
+    result.push(arg);
+  }
+  return result;
+}
+
+function expandMultiValueOptions(args: string[], definitions: Map<string, OptionDefinition>, config: Record<string, unknown> = {}): string[] {
   const byName = new Map<string, OptionDefinition>();
   for (const definition of definitions.values()) {
     for (const name of [definition.key, ...definition.aliases, ...implicitAliases(definition.key)]) byName.set(name, definition);
@@ -1451,16 +1611,17 @@ function expandNargs(args: string[], definitions: Map<string, OptionDefinition>)
     const optionName = optionNameFromArg(arg);
     if (!optionName) continue;
     const definition = byName.get(optionName);
-    if (!definition?.nargs || arg.includes('=')) continue;
+    if (!definition || arg.includes('=')) continue;
 
+    const limit = definition.nargs ?? (definition.type === 'array' && config['greedy-arrays'] !== false ? Number.POSITIVE_INFINITY : 0);
     let consumed = 0;
-    while (consumed < definition.nargs && index + 1 < args.length) {
+    while (consumed < limit && index + 1 < args.length) {
       const next = args[index + 1]!;
-      if (next.startsWith('-')) break;
+      if (next.startsWith('-') && !(definition.nargs !== undefined && config['nargs-eats-options'] === true)) break;
       result.push(next);
       index += 1;
       consumed += 1;
-      if (consumed < definition.nargs) result.push(arg);
+      if (consumed < limit && index + 1 < args.length && !args[index + 1]!.startsWith('-')) result.push(arg);
     }
   }
   return result;
