@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import realYargs from 'yargs';
 import yargs from '../src/index.ts';
 import yargsSubpath from '../src/yargs.ts';
@@ -47,6 +50,47 @@ test('supports yargs/yargs and helpers subpath compatibility', () => {
   assert.equal(yargsSubpath(['--enabled']).boolean('enabled').parseSync().enabled, true);
   assert.deepEqual(Parser(['--name', 'Ada'], { opts: { name: { type: 'string' } } }).name, 'Ada');
   assert.deepEqual(applyExtends({ ok: true }), { ok: true });
+});
+
+test('supports config, env, pkgConf, middleware, normalize and nargs flows', async (t) => {
+  const previousEnv = process.env.MCARGS_PORT;
+  t.after(() => {
+    if (previousEnv === undefined) delete process.env.MCARGS_PORT;
+    else process.env.MCARGS_PORT = previousEnv;
+  });
+
+  const dir = mkdtempSync(join(tmpdir(), 'mcargs-'));
+  const configPath = join(dir, 'config.json');
+  writeFileSync(configPath, JSON.stringify({ name: 'Ada', nested: { value: 42 }, file: './a/../b' }));
+  writeFileSync(join(dir, 'package.json'), JSON.stringify({ mcargs: { debug: true } }));
+  process.env.MCARGS_PORT = '3000';
+
+  const argv = await yargs(['--config', configPath, '--pair', 'x', 'y'])
+    .config('config')
+    .env('MCARGS')
+    .pkgConf('mcargs', dir)
+    .normalize('file')
+    .nargs('pair', 2)
+    .middleware((parsed) => ({ fromMiddleware: parsed.name === 'Ada' }), true)
+    .parseAsync();
+
+  assert.equal(argv.name, 'Ada');
+  assert.deepEqual(argv.nested, { value: 42 });
+  assert.equal(argv.port, 3000);
+  assert.equal(argv.debug, true);
+  assert.equal(argv.file, 'b');
+  assert.deepEqual(argv.pair, ['x', 'y']);
+  assert.equal(argv.fromMiddleware, true);
+});
+
+test('supports commandDir for CommonJS command modules', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'mcargs-commands-'));
+  mkdirSync(join(dir, 'commands'));
+  writeFileSync(join(dir, 'commands', 'hello.cjs'), `module.exports = { command: 'hello <name>', builder: y => y.positional('name', { type: 'string' }), handler: argv => { argv.greeted = argv.name } }`);
+
+  const argv = yargs(['hello', 'Ada']).commandDir(join(dir, 'commands')).parseSync();
+  assert.equal(argv.name, 'Ada');
+  assert.equal(argv.greeted, 'Ada');
 });
 
 test('supports additional validation APIs', () => {

@@ -1,4 +1,9 @@
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { dirname, extname, join, normalize as normalizePath, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
+
+const require = createRequire(import.meta.url);
 
 export type PrimitiveOptionType = 'string' | 'number' | 'boolean' | 'array' | 'count';
 
@@ -34,6 +39,8 @@ export type FailCallback = (message: string, error: Error, yargs: Argv) => void;
 export type CheckFunction = (argv: Arguments) => boolean | string | void;
 export type Builder = ((yargs: Argv) => Argv | void) | OptionsMap;
 export type Handler = (argv: Arguments) => void | Promise<void>;
+export type MiddlewareFunction = (argv: Arguments) => void | Dictionary | Promise<void | Dictionary>;
+export type ConfigParseFunction = (configPath: string) => Dictionary;
 
 export interface CommandModule {
   command: string | string[];
@@ -59,10 +66,10 @@ export interface Argv {
   command(command: string | string[] | CommandModule, describe?: string | false, builder?: Builder, handler?: Handler): this;
   addHelpOpt(option?: string | boolean, description?: string): this;
   addShowHiddenOpt(option?: string | boolean, description?: string): this;
-  commandDir(): this;
+  commandDir(directory: string, options?: { extensions?: string[]; recurse?: boolean }): this;
   commands(command: string | string[] | CommandModule, describe?: string | false, builder?: Builder, handler?: Handler): this;
-  completion(): this;
-  config(): this;
+  completion(command?: string, description?: string, fn?: (current: string, argv: Arguments) => string[] | Promise<string[]>): this;
+  config(key?: string | Dictionary | boolean, description?: string | ConfigParseFunction, parseFn?: ConfigParseFunction): this;
   conflicts(key: string | Dictionary<string | string[]>, value?: string | string[]): this;
   count(keys: string | string[]): this;
   default(key: string | Record<string, unknown>, value?: unknown): this;
@@ -72,8 +79,8 @@ export interface Argv {
   demandOption(keys: string | string[], message?: string): this;
   deprecateOption(key: string, message?: string): this;
   describe(key: string | Record<string, string>, description?: string): this;
-  detectLocale(): this;
-  env(): this;
+  detectLocale(enabled?: boolean): this;
+  env(prefix?: string | false): this;
   epilog(text: string): this;
   epilogue(text: string): this;
   example(command: string, description: string): this;
@@ -99,9 +106,9 @@ export interface Argv {
   hide(key: string): this;
   implies(key: string | Dictionary<string | string[]>, value?: string | string[]): this;
   locale(locale?: string): string | this;
-  middleware(): this;
-  nargs(): this;
-  normalize(): this;
+  middleware(callbacks: MiddlewareFunction | MiddlewareFunction[], applyBeforeValidation?: boolean): this;
+  nargs(key: string | Dictionary<number>, count?: number): this;
+  normalize(keys: string | string[]): this;
   number(keys: string | string[]): this;
   option(key: string, options?: Options | PrimitiveOptionType): this;
   options(options: OptionsMap): this;
@@ -109,6 +116,7 @@ export interface Argv {
   parseAsync(args?: string | string[]): Promise<Arguments>;
   parseSync(args?: string | string[]): Arguments;
   parserConfiguration(config: Record<string, unknown>): this;
+  pkgConf(key: string, cwd?: string): this;
   positional(key: string, options?: PositionalOptions): this;
   recommendCommands(): this;
   require(keys?: string | string[] | number, max?: number | string, msg?: string): this;
@@ -129,7 +137,7 @@ export interface Argv {
   usage(message: string): this;
   usageConfiguration(config: Dictionary): this;
   version(version?: string | boolean): this;
-  wrap(): this;
+  wrap(width?: number | null): this;
 }
 
 interface OptionDefinition extends Options {
@@ -159,19 +167,9 @@ interface ParseState {
 }
 
 const noopMethods = new Set([
-  'commandDir',
-  'completion',
-  'config',
-  'detectLocale',
-  'env',
-  'middleware',
-  'nargs',
-  'normalize',
-  'pkgConf',
   'recommendCommands',
   'updateLocale',
-  'updateStrings',
-  'wrap'
+  'updateStrings'
 ]);
 
 export class McargsError extends Error {
@@ -199,6 +197,13 @@ class Mcargs implements Argv {
   private demandedCommandMaxMessage?: string;
   private groupMap = new Map<string, string[]>();
   private skippedValidation = new Set<string>();
+  private configObjects: Dictionary[] = [];
+  private configDefinitions: Array<{ key: string; parse?: ConfigParseFunction }> = [];
+  private envPrefix?: string;
+  private pkgConfEntries: Array<{ key: string; cwd: string }> = [];
+  private middlewareBeforeValidation: MiddlewareFunction[] = [];
+  private middlewareAfterValidation: MiddlewareFunction[] = [];
+  private completionFunction?: (current: string, argv: Arguments) => string[] | Promise<string[]>;
   private usageMessage?: string;
   private epilogMessage?: string;
   private failCallback?: FailCallback;
@@ -218,7 +223,7 @@ class Mcargs implements Argv {
   private helpOption?: string;
   private versionOption?: string;
   private versionValue?: string;
-  private parserConfig: Record<string, unknown> = { 'camel-case-expansion': true, 'dot-notation': true, 'boolean-negation': true, 'populate--': true };
+  private parserConfig: Record<string, unknown> = { 'camel-case-expansion': true, 'dot-notation': true, 'boolean-negation': true, 'populate--': false };
 
   constructor(args: string[] = process.argv.slice(2)) {
     this.args = [...args];
@@ -483,6 +488,86 @@ class Mcargs implements Argv {
     return this;
   }
 
+  config(key: string | Dictionary | boolean = 'config', description?: string | ConfigParseFunction, parseFn?: ConfigParseFunction): this {
+    if (key === false) return this;
+    if (typeof key === 'object') {
+      this.configObjects.push(key);
+      return this;
+    }
+
+    const optionKey = key === true ? 'config' : key;
+    const parser = typeof description === 'function' ? description : parseFn;
+    this.configDefinitions.push({ key: optionKey, parse: parser });
+    this.option(optionKey, {
+      type: 'string',
+      describe: typeof description === 'string' ? description : 'Path to JSON config file'
+    });
+    return this;
+  }
+
+  env(prefix?: string | false): this {
+    if (prefix === false) {
+      this.envPrefix = undefined;
+      return this;
+    }
+    this.envPrefix = prefix ?? '';
+    return this;
+  }
+
+  pkgConf(key: string, cwd = process.cwd()): this {
+    this.pkgConfEntries.push({ key, cwd });
+    return this;
+  }
+
+  middleware(callbacks: MiddlewareFunction | MiddlewareFunction[], applyBeforeValidation = false): this {
+    const target = applyBeforeValidation ? this.middlewareBeforeValidation : this.middlewareAfterValidation;
+    target.push(...asArray(callbacks));
+    return this;
+  }
+
+  nargs(key: string | Dictionary<number>, count?: number): this {
+    if (typeof key === 'object') {
+      for (const [name, value] of Object.entries(key)) this.nargs(name, value);
+      return this;
+    }
+    const definition = this.ensureOption(key);
+    definition.nargs = count;
+    if (definition.type === 'boolean' && !definition.boolean) definition.type = 'string';
+    return this;
+  }
+
+  normalize(keys: string | string[]): this {
+    for (const key of asArray(keys)) this.ensureOption(key).normalize = true;
+    return this;
+  }
+
+  detectLocale(enabled = true): this {
+    this.detectLocaleEnabled = enabled;
+    return this;
+  }
+
+  completion(command = 'completion', _description?: string, fn?: (current: string, argv: Arguments) => string[] | Promise<string[]>): this {
+    this.completionCommand = command;
+    this.completionFunction = fn;
+    return this;
+  }
+
+  commandDir(directory: string, options: { extensions?: string[]; recurse?: boolean } = {}): this {
+    const base = resolve(directory);
+    const extensions = options.extensions ?? ['.js', '.cjs', '.json'];
+    for (const file of findCommandFiles(base, extensions, options.recurse ?? false)) {
+      const loaded = require(file) as CommandModule | { default?: CommandModule };
+      const commandModule = 'default' in loaded && loaded.default ? loaded.default : loaded;
+      this.command(commandModule as CommandModule);
+    }
+    return this;
+  }
+
+  wrap(width: number | null = this.terminalWidth()): this {
+    this.wrapWidth = width === null ? undefined : width;
+    return this;
+  }
+
   help(option: string | boolean = 'help', description = 'Show help'): this {
     if (option === false) {
       if (this.helpOption) this.definitions.delete(this.helpOption);
@@ -578,7 +663,18 @@ class Mcargs implements Argv {
     return aliases;
   }
 
-  getCompletion(_args: string[], done: (completions: string[]) => void): void {
+  getCompletion(args: string[], done: (completions: string[]) => void): void {
+    const argv = this.parseSync(args);
+    const current = args.at(-1) ?? '';
+    if (this.completionFunction) {
+      const result = this.completionFunction(current, argv);
+      if (result && typeof (result as Promise<string[]>).then === 'function') {
+        void (result as Promise<string[]>).then((completions) => done(completions));
+      } else {
+        done(result as string[]);
+      }
+      return;
+    }
     const completions = [
       ...this.commands.flatMap((command) => command.names),
       ...[...this.definitions.values()].flatMap((definition) => optionNames(definition))
@@ -776,12 +872,13 @@ class Mcargs implements Argv {
   }
 
   private parseWithoutCommand(args: string[]): ParseState {
+    const expandedArgs = expandNargs(args, this.definitions);
     const knownOptions = this.toParseArgsOptions();
-    const optionConfig = this.strictOptionMode ? knownOptions : discoverUnknownOptions(args, knownOptions);
+    const optionConfig = this.strictOptionMode ? knownOptions : discoverUnknownOptions(expandedArgs, knownOptions);
     let parsed;
     try {
       parsed = parseArgs({
-        args,
+        args: expandedArgs,
         options: optionConfig,
         allowPositionals: true,
         strict: this.strictOptionMode,
@@ -825,21 +922,25 @@ class Mcargs implements Argv {
       }
 
       value = coerceValue(definition.key, value, definition);
-      setArgvValue(argv, definition.key, value);
-      for (const alias of definition.aliases) setArgvValue(argv, alias, value);
+      setArgvValue(argv, definition.key, value, this.parserConfig);
+      for (const alias of definition.aliases) setArgvValue(argv, alias, value, this.parserConfig);
     }
 
     for (const [key, value] of Object.entries(values)) {
       if (consumed.has(key) || isImplicitAliasOfKnownOption(key, this.definitions)) continue;
-      setArgvValue(argv, key, coerceUnknownValue(value));
+      setArgvValue(argv, key, coerceUnknownValue(value), this.parserConfig);
     }
 
-    argv._ = parsed.positionals.map(toPositionalValue);
-    const dashDash = collectDashDash(args);
-    if (dashDash && this.parserConfig['populate--'] !== false) {
+    argv._ = shouldParsePositionalNumbers(this.parserConfig) ? parsed.positionals.map(toPositionalValue) : parsed.positionals;
+    const dashDash = collectDashDash(expandedArgs);
+    if (dashDash && this.parserConfig['populate--'] === true) {
       argv['--'] = dashDash;
+      argv._ = argv._.slice(0, Math.max(0, argv._.length - dashDash.length));
     }
 
+    this.applyConfigSources(argv);
+    this.applyEnv(argv);
+    this.runMiddlewareSync(argv, this.middlewareBeforeValidation);
     this.validateCommands(argv);
     this.validateRequiredArgs(argv);
     this.validateConflicts(argv);
@@ -861,6 +962,8 @@ class Mcargs implements Argv {
       output = `${this.versionValue ?? '0.0.0'}\n`;
       if (this.processExit) process.exit(0);
     }
+
+    this.runMiddlewareSync(argv, this.middlewareAfterValidation);
 
     return { argv, output };
   }
@@ -887,6 +990,13 @@ class Mcargs implements Argv {
     child.demandedCommandMaxMessage = this.demandedCommandMaxMessage;
     child.groupMap = new Map([...this.groupMap].map(([key, value]) => [key, [...value]]));
     child.skippedValidation = new Set(this.skippedValidation);
+    child.configObjects = this.configObjects.map((config) => structuredClone(config));
+    child.configDefinitions = this.configDefinitions.map((config) => ({ ...config }));
+    child.envPrefix = this.envPrefix;
+    child.pkgConfEntries = this.pkgConfEntries.map((entry) => ({ ...entry }));
+    child.middlewareBeforeValidation = [...this.middlewareBeforeValidation];
+    child.middlewareAfterValidation = [...this.middlewareAfterValidation];
+    child.completionFunction = this.completionFunction;
     child.usageMessage = this.usageMessage;
     child.epilogMessage = this.epilogMessage;
     child.failCallback = this.failCallback;
@@ -947,12 +1057,58 @@ class Mcargs implements Argv {
         if (options[name]) continue;
         const parseType = definition.type === 'boolean' || definition.type === 'count' ? 'boolean' : 'string';
         options[name] = { type: parseType };
-        if (definition.type === 'array' || definition.type === 'count') options[name].multiple = true;
+        if (definition.type === 'array' || definition.type === 'count' || definition.nargs !== undefined) options[name].multiple = true;
         if (name.length === 1) options[name].short = name;
       }
     }
 
     return options;
+  }
+
+  private applyConfigSources(argv: Arguments): void {
+    for (const entry of this.pkgConfEntries) {
+      const packageJson = findPackageJson(entry.cwd);
+      if (!packageJson) continue;
+      const config = readJson(packageJson) as Dictionary;
+      const value = config[entry.key];
+      if (isDictionary(value)) mergeDefaults(argv, value, this.definitions);
+    }
+
+    for (const config of this.configObjects) mergeDefaults(argv, config, this.definitions);
+
+    for (const definition of this.configDefinitions) {
+      const configValue = argv[definition.key];
+      if (typeof configValue !== 'string') continue;
+      const configPath = resolve(configValue);
+      const config = definition.parse ? definition.parse(configPath) : readJson(configPath);
+      mergeDefaults(argv, config, this.definitions);
+    }
+  }
+
+  private applyEnv(argv: Arguments): void {
+    if (this.envPrefix === undefined) return;
+    const prefix = this.envPrefix ? `${this.envPrefix.replace(/_$/u, '')}_` : '';
+    for (const [name, rawValue] of Object.entries(process.env)) {
+      if (rawValue === undefined || !name.startsWith(prefix)) continue;
+      const key = envNameToKey(name.slice(prefix.length));
+      if (!key) continue;
+      const definition = this.definitions.get(key) ?? findDefinitionByAlias(key, this.definitions);
+      const value = parseEnvValue(rawValue, definition);
+      setDefaultArgvValue(argv, definition?.key ?? key, value, definition);
+    }
+  }
+
+  private runMiddlewareSync(argv: Arguments, middleware: MiddlewareFunction[]): void {
+    for (const fn of middleware) {
+      const result = fn(argv);
+      if (result && typeof (result as Promise<unknown>).then === 'function') {
+        this.lastHandlerResult = Promise.resolve(this.lastHandlerResult).then(() => result as Promise<void | Dictionary>).then((resolved) => {
+          if (isDictionary(resolved)) Object.assign(argv, resolved);
+        });
+        continue;
+      }
+      if (isDictionary(result)) Object.assign(argv, result);
+    }
   }
 
   private validateCommands(argv: Arguments): void {
@@ -974,10 +1130,13 @@ class Mcargs implements Argv {
 
   private validateRequiredArgs(argv: Arguments): void {
     for (const definition of this.definitions.values()) {
-      if (!definition.requiresArg || this.skippedValidation.has(definition.key)) continue;
+      if (this.skippedValidation.has(definition.key)) continue;
       const value = argv[definition.key];
-      if (value === true || value === undefined || value === '') {
+      if (definition.requiresArg && (value === true || value === undefined || value === '')) {
         throw new McargsError(`Argument ${definition.key} requires an argument`, 'ERR_MCARGS_REQUIRES_ARG');
+      }
+      if (definition.nargs !== undefined && value !== undefined && (Array.isArray(value) ? value.length : 1) < definition.nargs) {
+        throw new McargsError(`Argument ${definition.key} expects ${definition.nargs} values`, 'ERR_MCARGS_NARGS');
       }
     }
   }
@@ -1033,6 +1192,8 @@ function discoverUnknownOptions(
   known: Record<string, { type: 'string' | 'boolean'; multiple?: boolean; short?: string }>
 ): Record<string, { type: 'string' | 'boolean'; multiple?: boolean; short?: string }> {
   const options = structuredClone(known);
+  const counts = countUnknownOptions(args, known);
+
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index]!;
     if (arg === '--') break;
@@ -1040,7 +1201,7 @@ function discoverUnknownOptions(
 
     if (arg.startsWith('--no-')) {
       const name = arg.slice(5);
-      if (!options[name]) options[name] = { type: 'boolean' };
+      if (!options[name]) options[name] = withMultiple({ type: 'boolean' }, counts.get(name));
       continue;
     }
 
@@ -1049,7 +1210,7 @@ function discoverUnknownOptions(
       const name = rawName!;
       if (!name || options[name]) continue;
       const next = args[index + 1];
-      options[name] = { type: inlineValue !== undefined || (next !== undefined && !next.startsWith('-')) ? 'string' : 'boolean' };
+      options[name] = withMultiple({ type: inlineValue !== undefined || (next !== undefined && !next.startsWith('-')) ? 'string' : 'boolean' }, counts.get(name));
       continue;
     }
 
@@ -1058,10 +1219,35 @@ function discoverUnknownOptions(
       const existing = Object.values(options).some((option) => option.short === shortName) || options[shortName];
       if (existing) continue;
       const next = args[index + 1];
-      options[shortName] = { type: shorts.length === 1 && next !== undefined && !next.startsWith('-') ? 'string' : 'boolean', short: shortName };
+      options[shortName] = withMultiple({ type: shorts.length === 1 && next !== undefined && !next.startsWith('-') ? 'string' : 'boolean', short: shortName }, counts.get(shortName));
     }
   }
   return options;
+}
+
+function countUnknownOptions(args: string[], known: Record<string, { type: 'string' | 'boolean'; multiple?: boolean; short?: string }>): Map<string, number> {
+  const counts = new Map<string, number>();
+  const knownShorts = new Set(Object.values(known).map((option) => option.short).filter(Boolean));
+  for (const arg of args) {
+    if (arg === '--') break;
+    if (arg.startsWith('--no-')) {
+      const name = arg.slice(5);
+      if (!known[name]) counts.set(name, (counts.get(name) ?? 0) + 1);
+    } else if (arg.startsWith('--')) {
+      const name = arg.slice(2).split('=', 1)[0]!;
+      if (!known[name]) counts.set(name, (counts.get(name) ?? 0) + 1);
+    } else if (arg.startsWith('-') && arg !== '-') {
+      for (const shortName of arg.slice(1)) {
+        if (!known[shortName] && !knownShorts.has(shortName)) counts.set(shortName, (counts.get(shortName) ?? 0) + 1);
+      }
+    }
+  }
+  return counts;
+}
+
+function withMultiple<T extends { multiple?: boolean }>(option: T, count = 0): T {
+  if (count > 1) option.multiple = true;
+  return option;
 }
 
 function inferType(options: Options, fallback: PrimitiveOptionType = 'boolean'): PrimitiveOptionType {
@@ -1086,9 +1272,13 @@ function typeFromDefault(value: unknown): PrimitiveOptionType | undefined {
   return undefined;
 }
 
-function asArray(value: string | string[] | undefined): string[] {
+function asArray<T>(value: T | T[] | undefined): T[] {
   if (value === undefined) return [];
   return Array.isArray(value) ? value : [value];
+}
+
+function shouldParsePositionalNumbers(config: Record<string, unknown>): boolean {
+  return config['parse-positional-numbers'] !== false;
 }
 
 function splitArgs(args: string | string[]): string[] {
@@ -1120,11 +1310,21 @@ function isImplicitAliasOfKnownOption(key: string, definitions: Map<string, Opti
   return false;
 }
 
-function setArgvValue(argv: Arguments, key: string, value: unknown): void {
-  argv[key] = value;
-  if (key.includes('.')) setDottedValue(argv, key, value);
+function setArgvValue(argv: Arguments, key: string, value: unknown, config: Record<string, unknown> = {}): void {
+  if (config['dot-notation'] !== false && key.includes('.')) {
+    setDottedValue(argv, key, value);
+  } else {
+    argv[key] = value;
+  }
   const camel = camelCase(key);
-  if (camel !== key) argv[camel] = value;
+  if (config['camel-case-expansion'] !== false && camel !== key) argv[camel] = value;
+}
+
+function setDefaultArgvValue(argv: Arguments, key: string, value: unknown, definition?: OptionDefinition): void {
+  if (argv[key] !== undefined && argv[key] !== definition?.default) return;
+  const coerced = definition ? coerceValue(definition.key, value, definition) : coerceUnknownValue(value);
+  setArgvValue(argv, key, coerced);
+  for (const alias of definition?.aliases ?? []) setArgvValue(argv, alias, coerced);
 }
 
 function setDottedValue(argv: Arguments, key: string, value: unknown): void {
@@ -1153,6 +1353,11 @@ function coerceValue(key: string, value: unknown, definition: Options & { type: 
     }
   } else if (definition.type === 'boolean') {
     if (Array.isArray(coerced)) coerced = coerced.at(-1);
+  }
+
+  if (definition.normalize) {
+    if (Array.isArray(coerced)) coerced = coerced.map((entry) => typeof entry === 'string' ? normalizePath(entry) : entry);
+    else if (typeof coerced === 'string') coerced = normalizePath(coerced);
   }
 
   if (definition.coerce) coerced = definition.coerce(coerced);
@@ -1205,6 +1410,46 @@ function collectDashDash(args: string[]): string[] | undefined {
   const index = args.indexOf('--');
   if (index === -1) return undefined;
   return args.slice(index + 1);
+}
+
+function expandNargs(args: string[], definitions: Map<string, OptionDefinition>): string[] {
+  const byName = new Map<string, OptionDefinition>();
+  for (const definition of definitions.values()) {
+    for (const name of [definition.key, ...definition.aliases, ...implicitAliases(definition.key)]) byName.set(name, definition);
+  }
+
+  const result: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]!;
+    result.push(arg);
+    if (arg === '--') {
+      result.push(...args.slice(index + 1));
+      break;
+    }
+
+    const optionName = optionNameFromArg(arg);
+    if (!optionName) continue;
+    const definition = byName.get(optionName);
+    if (!definition?.nargs || arg.includes('=')) continue;
+
+    let consumed = 0;
+    while (consumed < definition.nargs && index + 1 < args.length) {
+      const next = args[index + 1]!;
+      if (next.startsWith('-')) break;
+      result.push(next);
+      index += 1;
+      consumed += 1;
+      if (consumed < definition.nargs) result.push(arg);
+    }
+  }
+  return result;
+}
+
+function optionNameFromArg(arg: string): string | undefined {
+  if (arg.startsWith('--no-')) return arg.slice(5);
+  if (arg.startsWith('--')) return arg.slice(2).split('=', 1)[0];
+  if (arg.startsWith('-') && arg.length === 2) return arg.slice(1);
+  return undefined;
 }
 
 function makeCommand(command: string | string[], description?: string | false, builder?: Builder, handler?: Handler): CommandDefinition {
@@ -1265,4 +1510,73 @@ function cloneDefinition(definition: OptionDefinition): OptionDefinition {
 function optionNames(definition: OptionDefinition): string[] {
   return [definition.key, ...definition.aliases]
     .map((name) => (name.length === 1 ? `-${name}` : `--${name}`));
+}
+
+function isDictionary(value: unknown): value is Dictionary {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function readJson(path: string): Dictionary {
+  return JSON.parse(readFileSync(path, 'utf8')) as Dictionary;
+}
+
+function mergeDefaults(argv: Arguments, config: Dictionary, definitions: Map<string, OptionDefinition>, prefix = ''): void {
+  for (const [key, value] of Object.entries(config)) {
+    const fullKey = prefix ? `${prefix}.${key}` : key;
+    if (isDictionary(value)) {
+      mergeDefaults(argv, value, definitions, fullKey);
+      if (argv[key] === undefined && !prefix) setArgvValue(argv, key, value);
+      continue;
+    }
+    const definition = definitions.get(fullKey) ?? definitions.get(key) ?? findDefinitionByAlias(fullKey, definitions) ?? findDefinitionByAlias(key, definitions);
+    setDefaultArgvValue(argv, definition?.key ?? fullKey, value, definition);
+  }
+}
+
+function findDefinitionByAlias(key: string, definitions: Map<string, OptionDefinition>): OptionDefinition | undefined {
+  for (const definition of definitions.values()) {
+    if (definition.aliases.includes(key) || implicitAliases(definition.key).includes(key)) return definition;
+  }
+  return undefined;
+}
+
+function envNameToKey(name: string): string {
+  return name.toLowerCase().replace(/__/gu, '.').replace(/_/gu, '-');
+}
+
+function parseEnvValue(value: string, definition?: OptionDefinition): unknown {
+  if (definition?.type === 'boolean') return !/^(?:false|0|no)$/iu.test(value);
+  if (definition?.type === 'number' || /^-?\d+(?:\.\d+)?$/u.test(value)) return Number(value);
+  if (definition?.type === 'array') return value.split(',').map((entry) => entry.trim());
+  if (/^(?:true|false)$/iu.test(value)) return value.toLowerCase() === 'true';
+  try {
+    return JSON.parse(value) as unknown;
+  } catch {
+    return value;
+  }
+}
+
+function findPackageJson(cwd: string): string | undefined {
+  let current = resolve(cwd);
+  while (true) {
+    const candidate = join(current, 'package.json');
+    if (existsSync(candidate)) return candidate;
+    const parent = dirname(current);
+    if (parent === current) return undefined;
+    current = parent;
+  }
+}
+
+function findCommandFiles(directory: string, extensions: string[], recurse: boolean): string[] {
+  if (!existsSync(directory)) return [];
+  const files: string[] = [];
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    const path = join(directory, entry.name);
+    if (entry.isDirectory()) {
+      if (recurse) files.push(...findCommandFiles(path, extensions, recurse));
+      continue;
+    }
+    if (entry.isFile() && extensions.includes(extname(entry.name))) files.push(path);
+  }
+  return files;
 }

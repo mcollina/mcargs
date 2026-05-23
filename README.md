@@ -77,4 +77,4 @@ Tests use the built-in `node:test` runner.
 
 ## License and Yargs attribution
 
-`mcargs` is MIT licensed. It implements the Yargs public interface, but no Yargs source code was copied or ported into this repository, and Yargs is not used at runtime. Yargs is only used as a development-time compatibility oracle in tests. If source code is copied or ported in the future, this README should be updated and the Yargs license should be included as requested.
+`mcargs` is MIT licensed. It implements the Yargs public interface, and portions are derived from Yargs behavior and public API design. Yargs is not used at runtime; it is only used as a development-time compatibility oracle in tests. The Yargs MIT license is included in [`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md).
