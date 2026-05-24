@@ -1,0 +1,36 @@
+{
+  "name": "mcargs",
+  "version": "0.1.0",
+  "description": "Yargs-compatible argument parsing on top of node:util parseArgs().",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./helpers": "./src/helpers.ts",
+    "./yargs": "./src/yargs.ts"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.ts"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "keywords": [
+    "args",
+    "argv",
+    "cli",
+    "parseArgs",
+    "yargs"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "yargs": "^18.0.0"
+  }
+}
